@@ -1,58 +1,411 @@
+coffee-loyalty/
+├── backend/
+│   ├── data.json
+│   ├── package.json
+│   └── server.js
+├── frontend/
+│   ├── package.json
+│   ├── public/
+│   │   └── index.html
+│   └── src/
+│       └── App.js
+└── README.md
+const express = require('express');
+const nodemailer = require('nodemailer');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const PORT = 3001;
+
+app.use(cors());
+app.use(bodyParser.json());
+
+const DATA_FILE = path.join(__dirname, 'data.json');
+let data = { users: {} };
+
+if (fs.existsSync(DATA_FILE)) {
+  data = JSON.parse(fs.readFileSync(DATA_FILE));
+}
+
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+function isSameDay(d1, d2) {
+  return (
+    d1.getFullYear() === d2.getFullYear() &&
+    d1.getMonth() === d2.getMonth() &&
+    d1.getDate() === d2.getDate()
+  );
+}
+
+app.post('/scan', (req, res) => {
+  const { email, shopId } = req.body;
+  if (!email || !shopId) return res.status(400).json({ error: 'Missing email or shopId' });
+
+  let user = data.users[email.toLowerCase()] || { scans: [] };
+
+  const today = new Date();
+  const alreadyScannedToday = user.scans.some(scan =>
+    scan.shopId === shopId && isSameDay(new Date(scan.date), today)
+  );
+
+  if (alreadyScannedToday) {
+    return res.json({ message: 'Already scanned this shop today', scans: user.scans });
+  }
+
+  const shopBrand = shopId.split('-')[0];
+  const hasBrandAlready = user.scans.some(scan => {
+    const brand = scan.shopId.split('-')[0];
+    return brand === shopBrand;
+  });
+
+  if (hasBrandAlready && !alreadyScannedToday) {
+    return res.status(400).json({ error: 'Already scanned a shop from this brand' });
+  }
+
+  user.scans.push({ shopId, date: today.toISOString() });
+  data.users[email.toLowerCase()] = user;
+  saveData();
+
+  const uniqueDays = new Set(user.scans.map(s => (new Date(s.date)).toDateString()));
+
+  const freebieReady = uniqueDays.size >= 4;
+
+  res.json({
+    message: 'Scan recorded',
+    scans: user.scans,
+    freebieReady,
+    uniqueDays: Array.from(uniqueDays),
+  });
+});
+
+app.post('/email-confirmation', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+
+  const user = data.users[email.toLowerCase()];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const uniqueDays = [...new Set(user.scans.map(s => (new Date(s.date)).toDateString()))].slice(0, 4);
+
+  const calendarLines = uniqueDays.map(d => `☕️ ${d}`).join('\n');
+
+  let transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: 'your-email@gmail.com',     // TODO: Replace with your Gmail
+      pass: 'your-app-password',        // TODO: Replace with your Gmail App Password
+    },
+  });
+
+  const mailOptions = {
+    from: 'your-email@gmail.com',
+    to: email,
+    subject: 'Your Coffee Purchase History & Freebie Confirmation',
+    text: `Hello!
+
+You have purchased 4 coffees on the following days:
+${calendarLines}
+
+Your 5th coffee is free! Please show this email at the counter to redeem.
+
+Thank you for being a loyal customer!`,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    res.json({ message: 'Confirmation email sent' });
+  } catch (err) {
+    console.error('Email sending error:', err);
+    res.status(500).json({ error: 'Failed to send email' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
+{
+  "name": "coffee-loyalty-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "nodemailer": "^6.9.4"
+  }
+}
+import React, { useState, useEffect, useRef } from 'react';
+import { Html5Qrcode } from 'html5-qrcode';
+
+const BEIGE = '#f5f0e6';
+const HOMER_YELLOW = '#f7d843';
+
+export default function App() {
+  const [email, setEmail] = useState('');
+  const [scans, setScans] = useState([]);
+  const [freebieReady, setFreebieReady] = useState(false);
+  const [uniqueDays, setUniqueDays] = useState([]);
+  const [showPopup, setShowPopup] = useState(false);
+  const [emailSent, setEmailSent] = useState(false);
+  const [error, setError] = useState(null);
+  const [scanning, setScanning] = useState(false);
+
+  const qrRegionId = 'qr-reader';
+  const html5QrcodeScannerRef = useRef(null);
+
+  useEffect(() => {
+    if (scanning && !html5QrcodeScannerRef.current) {
+      html5QrcodeScannerRef.current = new Html5Qrcode(qrRegionId);
+      html5QrcodeScannerRef.current
+        .start(
+          { facingMode: 'environment' },
+          {
+            fps: 10,
+            qrbox: 250,
+          },
+          qrCodeMessage => {
+            // Parse QR JSON
+            try {
+              const parsed = JSON.parse(qrCodeMessage);
+              if (parsed.shopId) {
+                handleScan(parsed.shopId);
+              } else {
+                setError('QR code does not contain a shopId');
+              }
+            } catch {
+              setError('Invalid QR code format');
+            }
+          },
+          errorMessage => {
+            // Ignore or log errors here
+          }
+        )
+        .catch(err => {
+          setError('Camera permission denied or not available');
+          setScanning(false);
+        });
+    }
+
+    return () => {
+      if (html5QrcodeScannerRef.current) {
+        html5QrcodeScannerRef.current.stop().catch(() => {});
+        html5QrcodeScannerRef.current = null;
+      }
+    };
+  }, [scanning]);
+
+  async function handleScan(shopId) {
+    setError(null);
+    if (!email) {
+      setError('Please enter your email before scanning.');
+      return;
+    }
+
+    try {
+      const response = await fetch('http://localhost:3001/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, shopId }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setScans(data.scans);
+        setFreebieReady(data.freebieReady);
+        setUniqueDays(data.uniqueDays);
+        if (data.freebieReady) setShowPopup(true);
+      } else {
+        setError(data.error || 'Error during scan');
+      }
+    } catch (err) {
+      setError('Network error during scan');
+    }
+  }
+
+  async function sendEmailConfirmation() {
+    setError(null);
+    try {
+      const response = await fetch('http://localhost:3001/email-confirmation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setEmailSent(true);
+      } else {
+        setError(data.error || 'Error sending email');
+      }
+    } catch {
+      setError('Network error sending email');
+    }
+  }
+
+  return (
+    <div style={{ backgroundColor: BEIGE, minHeight: '100vh', padding: 20, fontFamily: 'Arial, sans-serif' }}>
+      <h1 style={{ color: HOMER_YELLOW, textAlign: 'center' }}>☕ Coffee Loyalty Tracker ☕</h1>
+      <div style={{ maxWidth: 400, margin: 'auto' }}>
+        <label>Email:</label>
+        <input
+          type="email"
+          placeholder="your email"
+          value={email}
+          onChange={e => setEmail(e.target.value)}
+          style={{ width: '100%', padding: 8, marginBottom: 10 }}
+        />
+        {!scanning ? (
+          <button
+            onClick={() => setScanning(true)}
+            style={{
+              width: '100%',
+              padding: 10,
+              backgroundColor: HOMER_YELLOW,
+              border: 'none',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+            }}
+          >
+            Start Scan
+          </button>
+        ) : (
+          <button
+            onClick={() => setScanning(false)}
+            style={{
+              width: '100%',
+              padding: 10,
+              backgroundColor: '#ccc',
+              border: 'none',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+            }}
+          >
+            Stop Scan
+          </button>
+        )}
+
+        {error && <p style={{ color: 'red' }}>{error}</p>}
+
+        <div
+          id={qrRegionId}
+          style={{
+            marginTop: 20,
+            width: 300,
+            height: 300,
+            marginLeft: 'auto',
+            marginRight: 'auto',
+            border: `4px solid ${HOMER_YELLOW}`,
+            borderRadius: 8,
+          }}
+        ></div>
+
+        <h3 style={{ color: HOMER_YELLOW, marginTop: 30 }}>Your Scans:</h3>
+        <ul>
+          {scans.map((scan, i) => (
+            <li key={i}>
+              {scan.shopId} - {new Date(scan.date).toLocaleDateString()}
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {showPopup && (
+        <div
+          style={{
+            position: 'fixed',
+            top: '20%',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            backgroundColor: 'white',
+            border: `5px solid ${HOMER_YELLOW}`,
+            borderRadius: 15,
+            padding: 20,
+            maxWidth: 350,
+            boxShadow: '0 0 15px rgba(0,0,0,0.3)',
+            animation: 'popin 0.4s ease forwards',
+            zIndex: 9999,
+          }}
+        >
+          <h2 style={{ color: HOMER_YELLOW }}>🎉 Free Coffee Unlocked! 🎉</h2>
+          <p>You have scanned coffee purchases on these days:</p>
+          <ul>
+            {uniqueDays.map((day, i) => (
+              <li key={i}>
+                ☕ {new Date(day).toLocaleDateString()}
+              </li>
+            ))}
+          </ul>
+          {!emailSent ? (
+            <button
+              onClick={sendEmailConfirmation}
+              style={{
+                marginTop: 10,
+                padding: '10px 20px',
+                backgroundColor: HOMER_YELLOW,
+                border: 'none',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+              }}
+            >
+              Send Email Confirmation
+            </button>
+          ) : (
+            <p style={{ color: 'green', marginTop: 10 }}>Email sent! Check your inbox.</p>
+          )}
+
+          <button
+            onClick={() => setShowPopup(false)}
+            style={{
+              marginTop: 10,
+              padding: '8px 12px',
+              border: 'none',
+              backgroundColor: '#eee',
+              cursor: 'pointer',
+              fontSize: 14,
+            }}
+          >
+            Close
+          </button>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes popin {
+          0% {opacity: 0; transform: translateX(-50%) scale(0.7);}
+          100% {opacity: 1; transform: translateX(-50%) scale(1);}
+        }
+      `}</style>
+    </div>
+  );
+}
+{
+  "name": "coffee-loyalty-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "html5-qrcode": "^2.3.9",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start"
+  }
+}
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Coffee Loyalty Card</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #f5f0e6;
-      color: #4b3832;
-      text-align: center;
-      margin: 0;
-      padding: 0;
-    }
-    h1 {
-      margin-top: 20px;
-    }
-    .card {
-      margin: 30px auto;
-      display: grid;
-      grid-template-columns: repeat(5, 80px);
-      gap: 10px;
-      max-width: 500px;
-    }
-    .cup {
-      width: 80px;
-      height: 80px;
-      background: #d3bfa6;
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 2em;
-      cursor: pointer;
-      user-select: none;
-    }
-    .cup.filled {
-      background: #8b5e3c;
-      color: white;
-    }
-    .free {
-      background: gold !important;
-      color: black !important;
-      font-weight: bold;
-    }
-    button {
-      margin-top: 20px;
-      padding: 10px 20px;
-      font-size: 1em;
-      background: #8b5e3c;
-      color: white;
-      border: none;
-      border-radius: 5px;
-      cursor: pointer;
-    }
-    button:hover {
-      background: #70452b;
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coffee Loyalty</title>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
